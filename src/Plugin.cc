@@ -45,7 +45,7 @@ static size_t url_response_handler(void *contents, size_t size, size_t nmemb, vo
 	mem->size += realsize;
 	mem->memory[mem->size]  = 0;
 
-	printf("%s\n", mem->memory);
+	printf("Callback called with:\n%s\n", mem->memory);
 
 	return realsize;
 	}
@@ -90,51 +90,20 @@ void parseData(const ChunkData& c_data, size_t c_len)
 static size_t url_response_handler_proto_buff(void *contents, size_t size, size_t nmemb, void *userp)
 	{
 	size_t realsize = size * nmemb;
-	uint offset = 0;
-	struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+	struct MemoryStruct *mem      = (struct MemoryStruct *)userp;
 
-	if ( realsize > mem->size + 1)
-		mem->memory = (char *)realloc(mem->memory, realsize + 1);
+	mem->memory = (char *)realloc(mem->memory, mem->size + realsize + 1);
 	if(mem->memory == NULL) {
 		/* out of memory! */
 		printf("not enough memory (realloc returned NULL)\n");
 		return 0;
 		}
 
-	memcpy(mem->memory, contents, realsize);
-	mem->size = realsize;
+	memcpy(&(mem->memory[mem->size]), contents, realsize);
+	mem->size              += realsize;
 	mem->memory[mem->size]  = 0;
 
-	GOOGLE_PROTOBUF_VERIFY_VERSION;
-	
-	while (realsize > offset)
-		{
-		if (realsize - offset < 4)
-			return offset;
-		
-		uint32 chunk_len = (mem->memory[offset] & 0xff) << 24 |
-			           (mem->memory[offset + 1] & 0xff) << 16 |
-			           (mem->memory[offset + 2] & 0xff) << 8  |
-			           (mem->memory[offset + 3] & 0xff);
-
-		printf("Parsing chunk of length %d\n", chunk_len);
-		// TODO: Parse the chunk data using protocol buffers
-		
-		if ( realsize - offset < chunk_len + 4 )
-			{
-			printf("Don't have the entire chunk...\n");
-			return offset;
-			}
-
-		ChunkData protobuf;
-		protobuf.ParsePartialFromArray(mem->memory + offset + 4, chunk_len);
-		parseData(protobuf, chunk_len);
-
-		offset += chunk_len + 4;
-		}
-	
-
-	return offset;
+	return realsize;
 	}
 
 // Implements HTTP Response for List from Google Safe Browsing API documentation
@@ -237,6 +206,76 @@ int Plugin::download_redirect_data_for_list(char* redirect_url)
 		printf("Error: %s\n", curl_easy_strerror(curl_res));
 	}
 
+	else
+		{
+		uint processed = 0;
+		while (processed < chunk.size)
+			{
+			uint32 chunk_len = (chunk.memory[processed] & 0xff) << 24 |
+				(chunk.memory[processed + 1] & 0xff) << 16 |
+				(chunk.memory[processed + 2] & 0xff) << 8  |
+				(chunk.memory[processed + 3] & 0xff);
+
+			printf("Parsing chunk of length %d\n", chunk_len);
+			
+			ChunkData protobuf;
+			protobuf.ParsePartialFromArray(chunk.memory + processed + 4, chunk_len);
+			parseData(protobuf, chunk_len);
+			
+			processed += chunk_len + 4;
+			}
+		
+		}
 	curl_easy_cleanup(curl);
+	return 0;
+	}
+
+
+// Given a hash prefix, downloads the full hash(es)
+int Plugin::download_full_hash_data(char* hash_prefix)
+	{
+	CURLcode curl_res;
+	CURL *curl = curl_easy_init();
+
+	struct MemoryStruct chunk;
+
+	chunk.memory = (char *)malloc(1); /* will be grown as needed by the realloc above */
+	chunk.size   = 0;       /* no data at this point */
+
+	const char* baseURL = "https://safebrowsing.google.com/safebrowsing/gethash";
+	const char* client = "api";
+	const char* apikey = "AIzaSyCdA-CmA7dusGVUIw3d9LubMumv-JgqxMg";
+	const char* appver = "1.5.2";
+	const char* pver = "3.0";
+
+	printf("Requesting full hashes for prefix 2b2392ce\n");
+	
+	char url[256];
+	snprintf(url, 256, "%s?client=%s&key=%s&appver=%s&pver=%s", baseURL, client, apikey, appver, pver);
+	char body[64];
+//	snprintf(body, 64, "%s:%s\n%d", strlen(hash_prefix), strlen(hash_prefix), 738870883);
+	snprintf(body, 64, "4:4\n\x2b\x23\x92\xce");
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	
+//	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, url_response_handler);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+	curl_res = curl_easy_perform(curl);
+	
+	if(curl_res != CURLE_OK) {
+		printf("Error: %s\n", curl_easy_strerror(curl_res));
+	}
+	else
+		{
+		char* second_line = strchr(chunk.memory, '\n') + 1;
+		char* third_line = strchr(second_line, '\n') + 1;
+		printf("Full hash: %s\n", format_hash(third_line, 32));
+		}
+
+	curl_easy_cleanup(curl);
+
 	return 0;
 	}
