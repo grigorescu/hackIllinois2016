@@ -5,6 +5,7 @@
 #include <curl/easy.h>
 
 #include "ChunkData.pb.h"
+#include <google/protobuf/message.h>
 
 namespace plugin { namespace HackIllinois_Safe_Browsing { Plugin plugin; } }
 
@@ -49,42 +50,39 @@ static size_t url_response_handler(void *contents, size_t size, size_t nmemb, vo
 	return realsize;
 	}
 
+char* format_hash(const char* hash, size_t prefix_len)
+	{
+	char* result = (char *) malloc(65);
+	for (uint i = 0; i < prefix_len; i++)
+		{
+		snprintf(result + 2*i, 3, "%02x", hash[i] & 0xff);
+		}
+
+	return result;
+	}
 void parseData(const ChunkData& c_data, size_t c_len) 
 	{	
-	for(int i=0; i < c_data.add_numbers_size(); i++) {
-		printf("Chunk Number: %d\n",c_data.chunk_number());
-		if(c_data.has_chunk_type()) {
-			ChunkData::ChunkType c_type = c_data.chunk_type();
-			switch(c_type) {
-				case ChunkData::ChunkType::ChunkData_ChunkType_ADD:
-					printf("Chunk Type: ADD\n");
-					break;
+	printf("Chunk Number: %d\n",c_data.chunk_number());
 
-				case ChunkData::ChunkType::ChunkData_ChunkType_SUB:
-					printf("Chunk Type: SUB\n");
-					break;
+	bool add = true;
+	if(c_data.has_chunk_type() && c_data.chunk_type() == ChunkData::ChunkType::ChunkData_ChunkType_SUB) 
+		{
+		add = false;
+		}
+
+	uint prefix_size = 4;
+	if(c_data.has_prefix_type() && c_data.prefix_type() == ChunkData::PrefixType::ChunkData_PrefixType_FULL_32B)
+		{
+		prefix_size = 32;
+		}
+
+	if(c_data.has_hashes()) {
+		std::string hashes = c_data.hashes();
+		for ( uint i = 0; i < hashes.size(); i += prefix_size)
+			{
+			printf("%sHash: %s\n", add ? "+":"-", format_hash(hashes.substr(i, prefix_size).c_str(), prefix_size));
 			}
 		}
-		
-	    	if(c_data.has_prefix_type()) {	
-			ChunkData::PrefixType p_type = c_data.prefix_type();
-			switch(p_type) {
-				case ChunkData::PrefixType::ChunkData_PrefixType_PREFIX_4B:
-					printf("Prefix is 4B\n");
-					break;
-
-				case ChunkData::PrefixType::ChunkData_PrefixType_FULL_32B:
-					printf("Prefix is 32B\n");
-					break;
-			}
-		}
-		/* hash is included for each hash 
- 		 * TODO
-		 **/
-		if(c_data.has_hashes()) {
-			printf("Have Hashes\n");	
-		}
-	}
 	return;
 	}
 
@@ -92,37 +90,51 @@ void parseData(const ChunkData& c_data, size_t c_len)
 static size_t url_response_handler_proto_buff(void *contents, size_t size, size_t nmemb, void *userp)
 	{
 	size_t realsize = size * nmemb;
+	uint offset = 0;
 	struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
-	mem->memory = (char *)realloc(mem->memory, mem->size + realsize + 1);
+	if ( realsize > mem->size + 1)
+		mem->memory = (char *)realloc(mem->memory, realsize + 1);
 	if(mem->memory == NULL) {
 		/* out of memory! */
 		printf("not enough memory (realloc returned NULL)\n");
 		return 0;
 		}
 
-	memcpy(&(mem->memory[mem->size]), contents, realsize);
-	mem->size += realsize;
+	memcpy(mem->memory, contents, realsize);
+	mem->size = realsize;
 	mem->memory[mem->size]  = 0;
 
 	GOOGLE_PROTOBUF_VERIFY_VERSION;
-
-	uint32 chunk_len = (mem->memory[0] & 0xff) << 24 |
-		           (mem->memory[1] & 0xff) << 16 |
-		           (mem->memory[2] & 0xff) << 8  |
-		           (mem->memory[3] & 0xff);
-
-	printf("Parsing chunk of length %d\n", chunk_len);
-	// TODO: Parse the chunk data using protocol buffers
-	char* chunk_data = mem->memory + 4;
 	
-	//ChunkData::
-	// Figure out how to do something like:
-	//ProtoBuffer->Parse(chunk_data, chunk_len);
-	// Parse the data.
-	//parseData(chunk_data, chunk_len);
+	while (realsize > offset)
+		{
+		if (realsize - offset < 4)
+			return offset;
+		
+		uint32 chunk_len = (mem->memory[offset] & 0xff) << 24 |
+			           (mem->memory[offset + 1] & 0xff) << 16 |
+			           (mem->memory[offset + 2] & 0xff) << 8  |
+			           (mem->memory[offset + 3] & 0xff);
 
-	return realsize;
+		printf("Parsing chunk of length %d\n", chunk_len);
+		// TODO: Parse the chunk data using protocol buffers
+		
+		if ( realsize - offset < chunk_len + 4 )
+			{
+			printf("Don't have the entire chunk...\n");
+			return offset;
+			}
+
+		ChunkData protobuf;
+		protobuf.ParsePartialFromArray(mem->memory + offset + 4, chunk_len);
+		parseData(protobuf, chunk_len);
+
+		offset += chunk_len + 4;
+		}
+	
+
+	return offset;
 	}
 
 // Implements HTTP Response for List from Google Safe Browsing API documentation
@@ -216,7 +228,7 @@ int Plugin::download_redirect_data_for_list(char* redirect_url)
 	snprintf(url, 1024, "https://%s", redirect_url);
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+//	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, url_response_handler_proto_buff);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
 	curl_res = curl_easy_perform(curl);
